@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "douyin-collections": {
+      "command": "/ABSOLUTE/PATH/TO/douyin-collections-mcp/.venv/bin/python",
+      "args": ["-m", "douyin_collections_mcp", "serve"],
+      "env": {
+        "DOUYIN_MCP_BROWSER": "chrome",
+        "DOUYIN_MCP_DATA_DIR": "/ABSOLUTE/PATH/TO/PRIVATE/douyin-collections-mcp"
+      }
+    }
+  }
+}

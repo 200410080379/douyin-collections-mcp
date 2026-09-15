@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "douyin-collections-mcp"
+version = "0.1.0"
+description = "Local MCP server for organizing your own Douyin favorites and liked videos"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.26,<2",
+    "playwright>=1.55,<2",
+]
+
+[project.scripts]
+douyin-collections-mcp = "douyin_collections_mcp.__main__:main"
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "ruff>=0.12"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/douyin_collections_mcp"]
