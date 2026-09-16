@@ -1,7 +1,9 @@
 """Account-scoped sync, classification previews, and resumable execution."""
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 
+from .browser import numeric_id
 from .errors import DouyinError
 
 
@@ -63,12 +65,92 @@ class CollectionService:
             "note": "缓存为已观察到的视频；不会因本次未出现而自动删除历史缓存。",
         }
 
-    async def search(self, query="", source=None, limit=50, offset=0):
+    async def search(self, query="", source=None, limit=50, offset=0, include_summaries=True):
         account = await self.browser.get_account()
+        items = self.store.list_videos(account["id"], source, query, limit, offset)
+        if include_summaries:
+            summaries = self.store.get_summaries_by_ids(account["id"], [v["id"] for v in items])
+            for item in items:
+                record = summaries.get(item["id"])
+                if record:
+                    item["native_summary"] = self._summary_result(record, cached=True)
         return {
             "account": account,
             "scope": "local_cache",
-            "items": self.store.list_videos(account["id"], source, query, limit, offset),
+            "items": items,
+        }
+
+    @staticmethod
+    def _summary_fresh(record):
+        try:
+            observed = datetime.fromisoformat(record["fetched_at"])
+            if observed.tzinfo is None:
+                return False
+            age = datetime.now(UTC) - observed
+            ttl = (
+                timedelta(hours=24)
+                if record["data"]["status"] == "available"
+                else timedelta(minutes=15)
+            )
+            return timedelta(0) <= age < ttl
+        except (ValueError, KeyError, TypeError):
+            return False
+
+    @classmethod
+    def _summary_result(cls, record, *, cached):
+        return {
+            **record["data"],
+            "fetched_at": record["fetched_at"],
+            "cached": cached,
+            "cache_expired": not cls._summary_fresh(record),
+        }
+
+    async def _read_summary(self, account_id, video_id, refresh):
+        record = self.store.get_summary(account_id, video_id)
+        if not refresh and record and self._summary_fresh(record):
+            return self._summary_result(record, cached=True)
+        result = await self.browser.get_video_summary(video_id)
+        await self._check_account(account_id)
+        self.store.upsert_summary(account_id, video_id, result)
+        return self._summary_result(self.store.get_summary(account_id, video_id), cached=False)
+
+    async def get_video_summary(self, video_id, refresh=False):
+        video_id = numeric_id(video_id)
+        account = await self.browser.get_account()
+        result = await self._read_summary(account["id"], video_id, refresh)
+        return {"account": account, **result}
+
+    async def get_video_summaries(self, video_ids, refresh=False):
+        if not isinstance(video_ids, list) or not 1 <= len(video_ids) <= 10:
+            raise ValueError("video_ids 须为1–10个视频ID。")
+        # Preserve first occurrence ordering; do not read or count duplicates twice.
+        ids = list(dict.fromkeys(numeric_id(value) for value in video_ids))
+        account = await self.browser.get_account()
+        results = []
+        for video_id in ids:
+            try:
+                result = await self._read_summary(account["id"], video_id, refresh)
+                results.append(result)
+            except DouyinError as exc:
+                if exc.code in {
+                    "account_mismatch",
+                    "not_logged_in",
+                    "login_or_verification_required",
+                    "browser_unavailable",
+                    "unexpected_origin",
+                }:
+                    raise  # Stop immediately when the account/session cannot be trusted.
+                results.append({"video_id": video_id, "status": "error", "error": exc.as_dict()})
+        await self._check_account(account["id"])
+        return {
+            "account": account,
+            "items": results,
+            "requested_count": len(video_ids),
+            "unique_count": len(ids),
+            "available_count": sum(r["status"] == "available" for r in results),
+            "unavailable_count": sum(r["status"] == "unavailable" for r in results),
+            "error_count": sum(r["status"] == "error" for r in results),
+            "complete": all(r["status"] != "error" for r in results),
         }
 
     async def prepare_plan(self, assignments, allow_favorite_liked=False):

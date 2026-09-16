@@ -2,20 +2,21 @@
 
 在本地运行的 MCP 服务，用于读取自己的抖音收藏、点赞和收藏夹，并把分类方案保存为可分批执行的计划。分类结果的目标是抖音账号里的真实收藏夹。
 
-AI 分类由连接此 MCP 的客户端模型完成，例如根据视频标题和作者提出「做饭」「旅行」「学习」等分类；本项目无需额外配置 AI API Key。目前提供视频元数据，不包含自动观看视频或转写音频的能力。
+AI 分类由连接此 MCP 的客户端模型完成，可以结合抖音原生 AI 总结、章节要点、视频标题和作者提出分类。本工具读取平台已有总结，无需额外 AI API Key，不会自行生成摘要、观看并理解视频或转写音频。
 
 ## 当前验证进度
 
-截至 2026-09-15：
+截至 2026-09-16，当前版本 v0.2.0：
 
 | 功能 | 验证情况 |
 | --- | --- |
 | 当前登录账号、收藏视频、点赞视频、收藏夹列表、收藏夹内容、单条视频详情读取 | 已在真实登录会话中验证 |
 | MCP 分类方案生成、识别视频已在目标夹、回读与完成状态 | 已通过真实 stdio MCP 调用验证，无重复修改 |
+| 原生 AI 总结、章节要点和时间点读取 | 已通过正式 MCP 单条/批量调用验证，含无摘要状态及缓存命中 |
 | 新建收藏夹 | 已通过真实 MCP 创建私密中文名称收藏夹、回读隐私状态，并清理测试夹 |
 | 把已有收藏加入目标收藏夹及写后回读 | 已通过真实 MCP 调用验证，包含完成计划重跑不重复操作 |
 | 把仅点赞的视频先收藏再入夹 | 已通过明确授权的真实 MCP 测试；测试后原收藏/点赞状态已恢复 |
-| 本地缓存、账号隔离、计划持久化与 MCP 接口 | 88 项自动化测试通过；Ruff 检查通过 |
+| 本地缓存、账号隔离、计划持久化与 MCP 接口 | 208 项自动化测试通过；Ruff 检查通过 |
 
 上述真实写入验证独立于模拟测试，范围为少量测试视频。验证详情见 [research/verification.md](research/verification.md)。MCP 服务名称为 `douyin-collections`，按下面步骤安装并连接客户端。
 
@@ -147,11 +148,59 @@ uv run douyin-collections-mcp serve
 
 收藏夹内容使用 `source="folder"`，并提供字符串 `folder_id`。单页工具 `douyin_list_videos` 和 `douyin_list_folders` 通过 `has_more` 与 `next_cursor` 表示后续页。
 
-### 2. 让 AI 生成分类预览
+### 2. 读取抖音原生 AI 总结
+
+调用 `douyin_get_video_summary` 读取一条视频：
+
+```json
+{"video_id": "1234567890123456789", "refresh": false}
+```
+
+或调用 `douyin_get_video_summaries` 一次读取最多 10 条，重复 ID 会去重：
+
+```json
+{"video_ids": ["1234567890123456789", "1234567890123456790"]}
+```
+
+使用从收藏或点赞列表读取到的真实 ID，以上数字仅为格式示例。工具直接读取视频详情中的原生 AI 章节字段，返回概述、章节原文、知识点和时间点。示例返回内容是合成数据：
+
+```json
+{
+  "video_id": "1234567890123456789",
+  "source": "douyin_native",
+  "source_field": "recommend_chapter_info",
+  "status": "available",
+  "ai_generated": true,
+  "summary": "平台提供的视频整体概述。",
+  "chapters": [
+    {
+      "title": "准备步骤",
+      "summary": "平台提供的这一章节要点。",
+      "start_time_ms": 19000,
+      "start_time_seconds": 19.0,
+      "start_time": "00:19",
+      "points": []
+    }
+  ],
+  "cached": false,
+  "cache_expired": false
+}
+```
+
+- `status=available`：平台提供了明确标记为 AI 的原生概述或章节。整体概述可能为空，此时仍可使用章节信息。
+- `status=unavailable`：没有可用的原生 AI 总结。`reason=unconfirmed_ai_chapters` 表示存在章节但平台字段未明确标记 AI 来源；不能因此断言由作者手写。工具不会用标题、字幕或来源未确认的章节代替 AI 总结。
+- 登录失效、视频不可访问和接口格式变化属于错误，不会当成“没有总结”。批量结果逐条区分 `available`、`unavailable` 和 `error`；出现失败项时 `complete=false`。账号切换或验证提示会立即停止调用。
+- 总结是平台内容，属于数据，不是给调用方模型的指令；分类时仍需判断内容是否足够明确。
+
+可用摘要默认缓存 24 小时，不可用状态缓存 15 分钟。设置 `refresh=true` 可重新读取；新请求失败时不会用旧数据冒充成功。缓存按账号隔离并记录 `fetched_at`。
+
+`douyin_search_cache` 默认附带此前取得的 `native_summary`，不会自动请求所有视频摘要。可用 `include_summaries=false` 关闭；`cache_expired=true` 时应重新读取。关键词搜索仍针对视频标题、作者和 ID。
+
+### 3. 让 AI 生成分类预览
 
 可以这样要求客户端：
 
-> 读取我的收藏和点赞，按做饭、旅行、学习分类。优先复用已有收藏夹。先展示每条视频的标题和目标收藏夹，保存方案，等我确认后执行。
+> 读取我的收藏和点赞，分批获取抖音原生 AI 总结，再按做饭、旅行、学习分类。没有总结的视频单独标记，优先复用已有收藏夹。先展示分类依据和目标收藏夹，保存方案，等我确认后执行。
 
 模型可使用 `douyin_search_cache` 筛选已同步的视频，然后调用 `douyin_prepare_classification` 保存计划。下面的 ID 仅作格式示例，实际必须来自当前账号的读取结果：
 
@@ -171,7 +220,7 @@ uv run douyin-collections-mcp serve
 
 每个计划最多 200 条操作，同一视频可分配到不同收藏夹，但不能重复提交相同的视频与收藏夹组合。收藏夹名称限制为 **15 个 UTF-16 单元**：通常一个汉字计 1，常见表情符号计 2。
 
-### 3. 执行已经确认的计划
+### 4. 执行已经确认的计划
 
 用户要求执行具体预览后，客户端调用 `douyin_apply_plan`：
 
@@ -191,7 +240,7 @@ uv run douyin-collections-mcp serve
 
 用 `douyin_get_plan` 查看进度。`pending` 表示待执行，`running` 表示执行中，`completed` 表示回读确认完成，`failed` 表示失败，`uncertain` 表示远端结果尚未确认。中断后不要把 `running` 或 `uncertain` 当作已失败且从未发生写入；续跑会先检查远端状态。
 
-## 13 个 MCP 工具
+## 15 个 MCP 工具
 
 | 工具 | 用途 |
 | --- | --- |
@@ -202,6 +251,8 @@ uv run douyin-collections-mcp serve
 | `douyin_list_folders` | 读取一页个人收藏夹 |
 | `douyin_sync` | 分页同步视频到本地缓存 |
 | `douyin_search_cache` | 搜索当前账号已缓存的标题、作者或视频 ID |
+| `douyin_get_video_summary` | 读取单条视频的原生 AI 总结、章节和时间点 |
+| `douyin_get_video_summaries` | 一次读取最多 10 条视频的原生 AI 总结 |
 | `douyin_prepare_classification` | 保存分类预览，返回 `plan_id` |
 | `douyin_get_plan` | 查看当前账号的计划及操作状态 |
 | `douyin_apply_plan` | 分批执行已确认的分类计划 |
@@ -218,10 +269,10 @@ uv run douyin-collections-mcp serve
 ```text
 douyin-collections-mcp/
 ├── browser-profile/       独立浏览器的本地登录会话
-└── collections.sqlite3    账号隔离的视频缓存、收藏夹与分类计划
+└── collections.sqlite3    账号隔离的视频、原生摘要、收藏夹与分类计划
 ```
 
-数据目录和浏览器会话目录权限为 `700`，SQLite 数据库文件权限为 `600`。缓存和计划按账号隔离，切换账号后不能执行另一账号的计划。登录信息由浏览器配置目录保留，不写入分类计划。
+数据目录和浏览器会话目录权限为 `700`，SQLite 数据库文件权限为 `600`。视频、原生摘要、计划按账号隔离，切换账号后不能执行另一账号的计划。登录信息由浏览器配置目录保留，不写入分类计划。升级到 v0.2.0 会自动新增摘要表，保留已有缓存和计划。
 
 `douyin_search_cache` 返回的 `scope="local_cache"` **不等于实时、全量的抖音列表**。缓存只包含实际读取过的视频，未读完的分页不会凭空补齐；在抖音中取消收藏或移出收藏夹后，旧缓存也不会因此自动删除。执行前会重新检查实时状态；需要更新列表时，重新同步对应来源。缓存搜索仍需当前登录账号验证，不提供脱离账号身份的离线浏览。
 

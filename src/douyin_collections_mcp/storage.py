@@ -18,6 +18,24 @@ from threading import RLock
 from uuid import uuid4
 
 OPERATION_STATUSES = frozenset({"pending", "running", "completed", "failed", "uncertain"})
+SUMMARY_FIELDS = frozenset(
+    {
+        "video_id",
+        "title",
+        "author",
+        "url",
+        "source",
+        "source_field",
+        "status",
+        "reason",
+        "summary",
+        "chapters",
+        "ai_generated",
+    }
+)
+CHAPTER_FIELDS = frozenset(
+    {"title", "summary", "start_time_ms", "start_time_seconds", "start_time", "points"}
+)
 
 
 def _now() -> str:
@@ -66,6 +84,48 @@ def _json(value: dict, label: str) -> str:
         raise ValueError(f"{label} must be JSON serializable") from exc
 
 
+def _summary_json(payload: dict) -> str:
+    """Accept normalized summary fields only; never persist a raw API response."""
+    if not payload.keys() <= SUMMARY_FIELDS:
+        raise ValueError("summary payload contains fields outside the normalized schema")
+    for field in ("title", "author", "url"):
+        if field in payload:
+            _text(payload[field], f"summary {field}")
+    if payload.get("summary") is not None:
+        _text(payload["summary"], "summary text")
+    if payload.get("source_field") not in (None, "recommend_chapter_info", "chapter_list"):
+        raise ValueError("invalid native summary source_field")
+    if payload.get("reason") not in (None, "no_native_ai_summary", "unconfirmed_ai_chapters"):
+        raise ValueError("invalid native summary absence reason")
+    if "ai_generated" in payload and type(payload["ai_generated"]) is not bool:
+        raise ValueError("summary ai_generated must be a boolean")
+    chapters = payload.get("chapters", [])
+    if not isinstance(chapters, list):
+        raise ValueError("summary chapters must be a list")
+    for chapter in chapters:
+        if not isinstance(chapter, dict) or not chapter.keys() <= CHAPTER_FIELDS:
+            raise ValueError("summary chapter is not a normalized chapter object")
+        for field in ("title", "summary", "start_time"):
+            if field in chapter:
+                _text(chapter[field], f"chapter {field}")
+        if "start_time_ms" in chapter and type(chapter["start_time_ms"]) is not int:
+            raise ValueError("chapter start_time_ms must be an integer")
+        if "start_time_seconds" in chapter and type(chapter["start_time_seconds"]) not in (
+            int,
+            float,
+        ):
+            raise ValueError("chapter start_time_seconds must be a number")
+        points = chapter.get("points", [])
+        if not isinstance(points, list):
+            raise ValueError("chapter points must be a list")
+        for point in points:
+            if not isinstance(point, dict) or not point.keys() <= {"title", "summary"}:
+                raise ValueError("summary point is not a normalized point object")
+            for field, value in point.items():
+                _text(value, f"point {field}")
+    return _json(payload, "summary payload")
+
+
 class Store:
     """SQLite persistence, safe to call from several server worker threads."""
 
@@ -108,6 +168,13 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS video_sources_lookup
                 ON video_sources(account_id, source, video_id);
+            CREATE TABLE IF NOT EXISTS video_summaries (
+                account_id TEXT NOT NULL,
+                video_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                fetched_at TEXT NOT NULL,
+                PRIMARY KEY (account_id, video_id)
+            );
             CREATE TABLE IF NOT EXISTS folders (
                 account_id TEXT NOT NULL,
                 folder_id TEXT NOT NULL,
@@ -135,6 +202,60 @@ class Store:
             );
             """
         )
+
+    def upsert_summary(self, account_id: str, video_id: str, payload: dict) -> None:
+        """Cache an already normalized native summary, including confirmed absence.
+
+        The caller must normalize the platform response before calling this method.
+        Transport/platform errors are not valid summary states and are never cached.
+        Public videos need not exist in this account's favorites or likes cache.
+        """
+        account_id = _identifier(account_id, "account_id")
+        video_id = _identifier(video_id, "video_id")
+        if not isinstance(payload, dict):
+            raise ValueError("summary payload must be a JSON object")
+        if payload.get("video_id") != video_id:
+            raise ValueError("summary video_id does not match the requested video")
+        if payload.get("source") != "douyin_native":
+            raise ValueError("summary source must be douyin_native")
+        if payload.get("status") not in ("available", "unavailable"):
+            raise ValueError("only available or unavailable native summaries can be cached")
+        serialized = _summary_json(payload)
+        with self._lock, self._db:
+            self._db.execute(
+                """INSERT INTO video_summaries VALUES (?, ?, ?, ?)
+                ON CONFLICT(account_id, video_id) DO UPDATE SET
+                    payload_json=excluded.payload_json, fetched_at=excluded.fetched_at""",
+                (account_id, video_id, serialized, _now()),
+            )
+
+    def get_summary(self, account_id: str, video_id: str) -> dict | None:
+        """Return normalized data and its UTC fetch time, or None for a cache miss."""
+        return self.get_summaries_by_ids(account_id, [video_id]).get(video_id)
+
+    def get_summaries_by_ids(self, account_id: str, video_ids: list[str]) -> dict[str, dict]:
+        """Return cached records in requested order, omitting missing/duplicate IDs."""
+        account_id = _identifier(account_id, "account_id")
+        if not isinstance(video_ids, list) or len(video_ids) > 200:
+            raise ValueError("video_ids must be a list of at most 200 IDs")
+        normalized = list(dict.fromkeys(_identifier(value, "video_id") for value in video_ids))
+        if not normalized:
+            return {}
+        placeholders = ",".join("?" for _ in normalized)
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT video_id, payload_json, fetched_at FROM video_summaries "
+                f"WHERE account_id=? AND video_id IN ({placeholders})",
+                [account_id, *normalized],
+            ).fetchall()
+        records = {
+            row["video_id"]: {
+                "data": json.loads(row["payload_json"]),
+                "fetched_at": row["fetched_at"],
+            }
+            for row in rows
+        }
+        return {video_id: records[video_id] for video_id in normalized if video_id in records}
 
     def upsert_videos(self, account_id: str, source: str, videos: list[dict]) -> None:
         account_id = _identifier(account_id, "account_id")

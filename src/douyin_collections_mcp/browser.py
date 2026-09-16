@@ -16,6 +16,7 @@ from playwright.async_api import async_playwright
 from .config import Settings
 from .errors import DouyinError
 from .normalize import check_response, folders_page, videos_page
+from .summary import native_summary
 
 ORIGIN = "https://www.douyin.com"
 SELF = "/aweme/v1/web/user/profile/self/"
@@ -319,6 +320,12 @@ class BrowserClient:
         return folders_page(
             await self._request(FOLDERS, params={"cursor": cursor, "count": str(limit)})
         )
+
+    async def get_video_summary(self, video_id):
+        """Read Douyin's existing AI chapter summary; never request new generation."""
+        video_id = numeric_id(video_id)
+        data = await self._request(DETAIL, params={"aweme_id": video_id})
+        return native_summary(data, video_id)
 
     async def all_folders(self):
         folders, seen, cursor = [], set(), "0"
